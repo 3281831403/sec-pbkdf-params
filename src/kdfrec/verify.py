@@ -5,6 +5,12 @@ standard base64.  The canonical shape is:
 
     alg=pbkdf2_sha256;iter=210000;salt=<base64>;digest=<base64>
 
+Every parameter needed to derive the digest is stored next to the digest
+itself.  Verification therefore uses the parameters carried by the record,
+never module level defaults; defaults only describe parameters for *new*
+records.  This keeps old records verifiable after the global defaults or the
+active policy have been strengthened.
+
 The functions in this module are deliberately small so they can be used by a
 migration script, an authentication path, and an offline audit job.
 """
@@ -29,12 +35,23 @@ _HASHES = {
 }
 
 
+def _b64decode(value: str | None) -> bytes | None:
+    if not value:
+        return None
+    try:
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (ValueError, UnicodeError, binascii.Error):
+        return None
+
+
 def parse_record(text: str) -> dict:
     """Parse a serialized record into a dictionary.
 
     Missing or malformed optional fields are represented by None.  The
     algorithm field is treated as a name that identifies the derivation
-    function and its hash.
+    function and its hash.  A missing algorithm is preserved as None so that
+    callers can reject the record; it is never silently replaced by a
+    default.
     """
     fields: dict[str, str] = {}
     for chunk in (text or "").split(";"):
@@ -44,7 +61,7 @@ def parse_record(text: str) -> dict:
         key, value = chunk.split("=", 1)
         fields[key.strip().lower()] = value.strip()
 
-    alg = fields.get("alg") or DEFAULT_ALG
+    alg = fields.get("alg") or None
 
     iterations = None
     raw_iterations = fields.get("iter")
@@ -54,21 +71,8 @@ def parse_record(text: str) -> dict:
         except ValueError:
             iterations = None
 
-    salt = None
-    raw_salt = fields.get("salt")
-    if raw_salt:
-        try:
-            salt = base64.b64decode(raw_salt.encode("ascii"), validate=True)
-        except (ValueError, UnicodeError, binascii.Error):
-            salt = None
-
-    digest = None
-    raw_digest = fields.get("digest")
-    if raw_digest:
-        try:
-            digest = base64.b64decode(raw_digest.encode("ascii"), validate=True)
-        except (ValueError, UnicodeError, binascii.Error):
-            digest = None
+    salt = _b64decode(fields.get("salt"))
+    digest = _b64decode(fields.get("digest"))
 
     return {
         "alg": alg,
@@ -78,22 +82,73 @@ def parse_record(text: str) -> dict:
     }
 
 
+def _valid_iterations(value) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 1
+    )
+
+
+def _salt_bytes(salt) -> bytes | None:
+    if not isinstance(salt, (bytes, bytearray)) or not salt:
+        return None
+    return bytes(salt)
+
+
+def _salt_is_unique(salt: bytes) -> bool:
+    """A real salt must not be a single repeated byte."""
+    return len(set(salt)) > 1
+
+
 def check_params(record: dict, policy: dict) -> list[str]:
-    """Return policy violations for the parameters in a record."""
+    """Return policy violations for the parameters in a record.
+
+    The record's own parameters are judged against the active policy.  A
+    record below the policy floor is rejected; ``needs_rehash`` reports that
+    it has to be upgraded before it can be used again.
+    """
     issues: list[str] = []
+
     alg = record.get("alg")
     allowed = policy.get("allowed_algs") or set(_HASHES)
-
     if not alg:
         issues.append("algorithm missing")
     elif alg not in allowed:
         issues.append("algorithm not allowed")
 
+    minimum = policy.get("min_iterations")
+    if minimum is None:
+        minimum = DEFAULT_MIN_ITERATIONS
+    iterations = record.get("iterations")
+    if iterations is None:
+        issues.append("iterations missing")
+    elif not _valid_iterations(iterations):
+        issues.append("iterations invalid")
+    elif iterations < int(minimum):
+        issues.append("iterations below minimum")
+
+    min_salt_len = policy.get("min_salt_len")
+    if min_salt_len is None:
+        min_salt_len = DEFAULT_MIN_SALT_LEN
+    min_salt_len = int(min_salt_len)
+    salt = _salt_bytes(record.get("salt"))
+    if salt is None:
+        issues.append("salt missing")
+    elif not _salt_is_unique(salt):
+        issues.append("salt repeated")
+    elif len(salt) < min_salt_len:
+        issues.append("salt too short")
+
     return issues
 
 
 def derive(password, record: dict) -> bytes:
-    """Derive a digest using the algorithm, salt, and iteration count."""
+    """Derive a digest using the algorithm, salt, and iteration count.
+
+    All three values are read from the record so that a record always
+    reproduces its own digest regardless of the current global defaults.
+    """
     alg = record.get("alg")
     if not alg:
         raise ValueError("algorithm is required")
@@ -102,15 +157,11 @@ def derive(password, record: dict) -> bytes:
         raise ValueError("unsupported algorithm")
 
     iterations = record.get("iterations")
-    if (
-        not isinstance(iterations, int)
-        or isinstance(iterations, bool)
-        or iterations < 1
-    ):
+    if not _valid_iterations(iterations):
         raise ValueError("iterations must be a positive integer")
 
-    salt = record.get("salt")
-    if not isinstance(salt, (bytes, bytearray)) or not salt:
+    salt = _salt_bytes(record.get("salt"))
+    if salt is None:
         raise ValueError("salt is required")
 
     if isinstance(password, str):
@@ -121,7 +172,7 @@ def derive(password, record: dict) -> bytes:
     return hashlib.pbkdf2_hmac(
         hash_name,
         password_bytes,
-        bytes(salt),
+        salt,
         iterations,
         dklen=DIGEST_LEN,
     )
@@ -137,37 +188,40 @@ def verify(password, record: dict, policy: dict) -> bool:
     if not isinstance(expected, (bytes, bytearray)) or not expected:
         return False
 
-    derived = derive(
-        password,
-        {
-            "alg": record.get("alg") or DEFAULT_ALG,
-            "iterations": DEFAULT_ITERATIONS,
-            "salt": DEFAULT_SALT,
-        },
-    )
-    return expected == derived
+    try:
+        derived = derive(password, record)
+    except (TypeError, ValueError):
+        return False
+
+    # Constant-time comparison: the amount of work must not reveal how much
+    # of the digest matched.
+    return hmac.compare_digest(bytes(expected), derived)
 
 
 def needs_rehash(record: dict, policy: dict) -> bool:
-    """Report whether a record should be re-derived with stronger parameters."""
-    minimum = int(policy.get("min_iterations", DEFAULT_MIN_ITERATIONS))
-    iterations = record.get("iterations")
-    if (
-        not isinstance(iterations, int)
-        or isinstance(iterations, bool)
-        or iterations < minimum
-    ):
-        return False
-    return False
+    """Report whether a record should be re-derived with stronger parameters.
+
+    Any record that no longer satisfies the active policy is flagged, with
+    an iteration count below the policy floor being the classic case.
+    """
+    return bool(check_params(record, policy)) or bool(validate_record(record))
 
 
 def format_record(alg: str, iterations: int, salt: bytes, digest: bytes) -> str:
-    """Serialize a record for storage."""
+    """Serialize a record for storage.
+
+    The derivation parameters travel with the digest.  Omitting them is what
+    makes a record impossible to verify after the defaults change.
+    """
     salt_b64 = base64.b64encode(bytes(salt)).decode("ascii")
     digest_b64 = base64.b64encode(bytes(digest)).decode("ascii")
 
-    parts = [f"alg={alg}"]
-    parts.append(f"digest={digest_b64}")
+    parts = [
+        f"alg={alg}",
+        f"iter={int(iterations)}",
+        f"salt={salt_b64}",
+        f"digest={digest_b64}",
+    ]
     return ";".join(parts)
 
 
@@ -179,13 +233,19 @@ def validate_record(record: dict) -> list[str]:
     if not alg:
         issues.append("algorithm missing")
 
-    salt = record.get("salt")
-    if not isinstance(salt, (bytes, bytearray)) or not salt:
+    iterations = record.get("iterations")
+    if iterations is None:
+        issues.append("iterations missing")
+    elif not _valid_iterations(iterations):
+        issues.append("iterations invalid")
+
+    salt = _salt_bytes(record.get("salt"))
+    if salt is None:
         issues.append("salt missing")
-    else:
-        salt_bytes = bytes(salt)
-        if len(set(salt_bytes)) == 1:
-            issues.append("salt repeated")
+    elif not _salt_is_unique(salt):
+        issues.append("salt repeated")
+    elif len(salt) < DEFAULT_MIN_SALT_LEN:
+        issues.append("salt too short")
 
     digest = record.get("digest")
     if not isinstance(digest, (bytes, bytearray)) or not digest:
@@ -199,16 +259,13 @@ def kdf_batch(attempts, policy: dict) -> dict:
 
     Each attempt is a tuple of the form (password, record).  The result
     contains a per-attempt boolean list plus accepted and rejected counts.
+    Records are handled independently: no state is carried from one attempt
+    to the next.
     """
     results: list[bool] = []
-    cached_digest = None
 
     for password, record in attempts:
-        if cached_digest is None:
-            cached_digest = record.get("digest")
-        pending = dict(record)
-        pending["digest"] = cached_digest
-        results.append(verify(password, pending, policy))
+        results.append(verify(password, record, policy))
 
     accepted = sum(1 for result in results if result)
     return {
